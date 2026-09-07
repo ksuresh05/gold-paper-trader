@@ -1,0 +1,55 @@
+name: Gold Paper Trader Daily Check
+
+# Runs once daily within the 8am-9pm GMT active window (matches the
+# script's SESSION_START_HOUR_GMT/SESSION_END_HOUR_GMT config). 12:00 UTC
+# is a safe middle-of-window choice, giving buffer on both sides.
+# NOTE: GitHub Actions does not guarantee exact timing -- runs can be
+# delayed a few minutes during high load. Acceptable for a once-daily
+# check within a wide window.
+on:
+  schedule:
+    - cron: '0 12 * * *'   # 12:00 UTC daily
+  workflow_dispatch: {}     # also allows manual triggering from the Actions tab, for testing
+
+permissions:
+  contents: write   # required so the workflow can commit updated state/report files back to the repo
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history not needed, but ensure we get the LATEST committed
+          # state/ and html/ files from the previous run, not a stale cache.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy yfinance
+
+      - name: Ensure state/html folders exist
+        run: mkdir -p state html
+
+      - name: Run single check
+        run: python3 gold_paper_trader.py --once
+
+      - name: Commit updated state and report back to the repo
+        # This is the critical step that makes continuity work across runs:
+        # GitHub Actions runners are ephemeral (fresh checkout every time),
+        # so without committing state/paper_state.json and state/trade_log.csv
+        # back to the repo, the script would "fresh start" on every single
+        # run and never actually track anything across days.
+        run: |
+          git config user.name "gold-paper-trader-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/ html/
+          # Only commit if something actually changed -- avoids empty commits
+          # on days where "No new completed bars" means nothing was written.
+          git diff --staged --quiet || git commit -m "Automated paper trader check: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
