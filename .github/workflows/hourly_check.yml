@@ -1,0 +1,60 @@
+name: Gold Paper Trader Hourly Check
+
+# Runs every hour, 24/7 -- matches the underlying 1h candle data (checking
+# more often wouldn't surface new information anyway). Entry-session
+# filtering (previously 8am-9pm GMT) has been removed from the script
+# itself (SESSION_FILTER_ENABLED=False) -- entries can now happen at any
+# hour, not just during that window. An open position is still monitored
+# every run regardless.
+# NOTE: GitHub Actions does not guarantee exact timing -- runs can be
+# delayed, especially at the top of the hour when many workflows across
+# GitHub fire simultaneously. Occasional delays of a few to several
+# minutes are normal and don't affect correctness (the script processes
+# ALL bars closed since the last check, not just the most recent one).
+on:
+  schedule:
+    - cron: '0 * * * *'   # top of every hour, every day
+  workflow_dispatch: {}     # also allows manual triggering from the Actions tab, for testing
+
+permissions:
+  contents: write   # required so the workflow can commit updated state/report files back to the repo
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history not needed, but ensure we get the LATEST committed
+          # state/ and html/ files from the previous run, not a stale cache.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy yfinance
+
+      - name: Ensure state/html folders exist
+        run: mkdir -p state html
+
+      - name: Run single check
+        run: python3 gold_paper_trader.py --once
+
+      - name: Commit updated state and report back to the repo
+        # This is the critical step that makes continuity work across runs:
+        # GitHub Actions runners are ephemeral (fresh checkout every time),
+        # so without committing state/paper_state.json and state/trade_log.csv
+        # back to the repo, the script would "fresh start" on every single
+        # run and never actually track anything across days.
+        run: |
+          git config user.name "gold-paper-trader-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state/ html/
+          # Only commit if something actually changed -- avoids empty commits
+          # on days where "No new completed bars" means nothing was written.
+          git diff --staged --quiet || git commit -m "Automated paper trader check: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
