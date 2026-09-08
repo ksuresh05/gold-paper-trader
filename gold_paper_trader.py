@@ -65,7 +65,7 @@ ATR_PERIOD = 14   # kept for reference/diagnostics even though USE_ATR_TRAIL=Fal
 # false crosses / noise-driven stop-outs (consistent with the tight-stop fragility flagged
 # repeatedly by the backtest's sanity checks). Set SESSION_FILTER_ENABLED=False to revert to
 # the exact validated 24/5 behavior for comparison.
-SESSION_FILTER_ENABLED = True
+SESSION_FILTER_ENABLED = False
 SESSION_START_HOUR_GMT = 8    # London open, approx
 SESSION_END_HOUR_GMT = 21     # NY afternoon, approx -- covers London+NY overlap and NY session
 
@@ -734,5 +734,3 @@ if __name__ == "__main__":
         main_once()
     else:
         main_continuous()
-
-
