@@ -1,38 +1,39 @@
-name: Gold Paper Trader Hourly Check
+name: Gold Paper Trader Continuous Check
 
-# Runs every hour, 24/7 -- matches the underlying 1h candle data (checking
-# more often wouldn't surface new information anyway). Entry-session
-# filtering (previously 8am-9pm GMT) has been removed from the script
-# itself (SESSION_FILTER_ENABLED=False) -- entries can now happen at any
-# hour, not just during that window. An open position is still monitored
-# every run regardless.
-# NOTE: GitHub Actions scheduling is BEST-EFFORT, not guaranteed. Real-world
-# testing showed gaps of 2-3+ hours between runs even on an hourly cron,
-# especially at the top of the hour (":00") when many workflows across all
-# of GitHub compete for the same runner capacity -- this is a documented,
-# widespread platform limitation, not specific to this workflow. Moving to
-# :17 past the hour reduces contention per GitHub's own guidance, but does
-# NOT guarantee exact hourly timing -- delays can still happen.
+# DESIGN: single long-running job per trigger, with an internal loop
+# (not a single --once call). Combined with `concurrency` below, this
+# solves the gap problem seen with pure hourly --once triggers:
+#   - Each job runs for ~70 minutes, checking every 15 minutes internally
+#     (~4-5 checks per job) via the script's own main_loop_for_duration().
+#   - The trigger fires every hour, but the loop runs slightly LONGER
+#     (70 min) than the trigger interval (60 min) -- so if the next
+#     hourly trigger is delayed (GitHub's scheduling is best-effort, not
+#     guaranteed -- see prior testing showing 2-7+ hour gaps on a bare
+#     --once/hourly-trigger design), the CURRENT job is still running and
+#     covering the gap. There should be no dead time where nothing is
+#     checking, as long as SOME trigger successfully starts within any
+#     70-minute window.
+#   - `concurrency` with cancel-in-progress: false means if a new hourly
+#     trigger fires while a previous job is still in its 70-minute loop,
+#     the NEW run is queued (not started, not cancelling the old one) --
+#     avoiding the two failure modes considered and rejected: (a) two
+#     runners racing to git push at once (git conflict / duplicate risk),
+#     and (b) killing an in-progress job's remaining coverage window.
 #
-# This delay does NOT cause incorrect results: process_new_bars() walks
-# forward through EVERY closed 1h bar since the last check, applying the
-# exact entry/exit logic to each one in the correct order -- so a stop hit
-# 2 hours ago is still detected and priced correctly once the script does
-# run, it's just detected later. The cost of a delay is TIME-TO-AWARENESS,
-# not correctness of the recorded trade history.
-#
-# If sub-hour, guaranteed-timely monitoring becomes necessary (e.g. for
-# real capital, not paper tracking), a genuine always-on process (e.g. a
-# paid PythonAnywhere always-on task) is the correct fix -- GitHub Actions'
-# free scheduler is not built for that reliability level.
+# This does NOT guarantee zero gaps -- if GitHub fails to start ANY
+# trigger for over 70 minutes (rare but possible during platform
+# incidents), there would still be a gap. But this is a large
+# improvement over the plain hourly --once design, which showed gaps of
+# 2-7+ hours in real testing even after moving off the top-of-hour minute.
 on:
   schedule:
-    - cron: '17 * * * *'   # 17 minutes past every hour, every day -- avoids top-of-hour
-                             # contention, per GitHub's own guidance: "To decrease the
-                             # chance of delay, schedule your workflow to run at a
-                             # different time of the hour." Still best-effort, not
-                             # guaranteed exact -- see note above.
+    - cron: '0 * * * *'   # every hour -- contention at :00 matters less now
+                            # since the job itself runs long and covers gaps
   workflow_dispatch: {}     # also allows manual triggering from the Actions tab, for testing
+
+concurrency:
+  group: gold-paper-trader-continuous
+  cancel-in-progress: false   # queue, don't cancel -- let an in-progress 70-min loop finish
 
 permissions:
   contents: write   # required so the workflow can commit updated state/report files back to the repo
@@ -40,12 +41,13 @@ permissions:
 jobs:
   run-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 90   # safety ceiling above the ~70min intended loop duration,
+                            # in case something hangs -- GitHub kills the job at this point
+                            # regardless (well under the platform's own 360min hard limit)
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Full history not needed, but ensure we get the LATEST committed
-          # state/ and html/ files from the previous run, not a stale cache.
           fetch-depth: 1
 
       - name: Set up Python
@@ -56,23 +58,15 @@ jobs:
       - name: Install dependencies
         run: pip install pandas numpy yfinance
 
-      - name: Ensure state/html folders exist
-        run: mkdir -p state html
-
-      - name: Run single check
-        run: python3 gold_paper_trader.py --once
-
-      - name: Commit updated state and report back to the repo
-        # This is the critical step that makes continuity work across runs:
-        # GitHub Actions runners are ephemeral (fresh checkout every time),
-        # so without committing state/paper_state.json and state/trade_log.csv
-        # back to the repo, the script would "fresh start" on every single
-        # run and never actually track anything across days.
+      - name: Configure git identity for commits
         run: |
           git config user.name "gold-paper-trader-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state/ html/
-          # Only commit if something actually changed -- avoids empty commits
-          # on days where "No new completed bars" means nothing was written.
-          git diff --staged --quiet || git commit -m "Automated paper trader check: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+
+      - name: Run continuous loop for ~70 minutes, committing after each check
+        # This runs main_loop_for_duration(), which checks every 15 minutes
+        # (via run_once()) and commits+pushes after EACH check individually
+        # -- not just once at the end -- so if the job is killed early
+        # (crash, timeout) no completed checks are lost, only whatever
+        # check was in progress at that moment.
+        run: python3 gold_paper_trader.py --loop-minutes 70 --check-interval-minutes 15 --git-commit-each-check
