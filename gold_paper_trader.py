@@ -728,9 +728,106 @@ def main_once():
     print("Single check complete. Exiting (will run again at the next scheduled time).")
 
 
+def main_bounded_loop(loop_minutes, check_interval_minutes, git_commit_each_check):
+    """
+    Runs a time-BOUNDED loop (not infinite): checks every
+    check_interval_minutes, for up to loop_minutes total, then exits
+    cleanly. Designed for GitHub Actions: a single workflow run stays
+    alive for a fixed duration (intentionally longer than the trigger
+    interval, e.g. 70 min on an hourly trigger) so that even if the NEXT
+    scheduled trigger is delayed, this run is still actively checking
+    and covering the gap.
+
+    If git_commit_each_check is True, commits+pushes state/html after
+    EVERY individual check (not just once at the end) -- so if the job
+    is killed early (crash, GitHub's own timeout), only the single
+    in-progress check is lost, not the whole run's accumulated work.
+    Requires git to be configured (user.name/user.email) and the
+    workflow to have write permission -- both handled by the calling
+    workflow, not this function.
+
+    Unlike main_continuous(), this does NOT gate on SESSION_START_HOUR_GMT/
+    SESSION_END_HOUR_GMT sleep-until-window logic -- it runs for its
+    fixed duration regardless of hour, since SESSION_FILTER_ENABLED
+    already controls entry-taking at the signal level, and this mode is
+    meant to be triggered repeatedly by an external scheduler (cron) 24/7
+    rather than deciding its own active window.
+    """
+    import time
+    from datetime import datetime as dt
+
+    print(f"=== Gold Paper Trader -- bounded loop mode: {loop_minutes} min total, "
+          f"checking every {check_interval_minutes} min ===")
+    end_time = dt.now(timezone.utc) + pd.Timedelta(minutes=loop_minutes)
+    check_num = 0
+
+    while dt.now(timezone.utc) < end_time:
+        check_num += 1
+        print(f"\n--- Check {check_num} (loop ends at {end_time.strftime('%H:%M UTC')}) ---")
+        try:
+            run_once()
+        except Exception as e:
+            print(f"ERROR during check: {e}")
+            print("Will retry on the next check within this loop.")
+
+        if git_commit_each_check:
+            _git_commit_and_push()
+
+        remaining = (end_time - dt.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            break
+        sleep_secs = min(check_interval_minutes * 60, remaining)
+        print(f"Sleeping {sleep_secs/60:.1f} min until next check (or loop end)...")
+        time.sleep(sleep_secs)
+
+    print(f"\nBounded loop complete after {check_num} check(s). Exiting.")
+
+
+def _git_commit_and_push():
+    """
+    Commits state/ and html/ if anything changed, and pushes. Used by
+    main_bounded_loop() to persist progress after each individual check,
+    rather than relying on the calling workflow to commit only once at
+    the very end (which would lose all progress if the job is killed
+    mid-loop). Assumes git user.name/email are already configured by the
+    calling environment (the GitHub Actions workflow does this before
+    invoking the script). Silently does nothing if git isn't available
+    or this isn't a git repo (e.g. running locally without git) --
+    prints a warning rather than crashing the whole check loop over a
+    non-critical commit failure.
+    """
+    import subprocess
+    try:
+        subprocess.run(["git", "add", "state/", "html/"], check=True, capture_output=True)
+        diff_check = subprocess.run(["git", "diff", "--staged", "--quiet"], capture_output=True)
+        if diff_check.returncode == 0:
+            print("No changes to commit this check.")
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        subprocess.run(["git", "commit", "-m", f"Automated paper trader check: {timestamp}"],
+                        check=True, capture_output=True)
+        subprocess.run(["git", "push"], check=True, capture_output=True)
+        print("Committed and pushed state/html updates.")
+    except subprocess.CalledProcessError as e:
+        print(f"WARNING: git commit/push failed (non-fatal, continuing loop): {e}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr.decode(errors='replace')[:500]}")
+    except FileNotFoundError:
+        print("WARNING: git not found on PATH -- skipping commit (non-fatal).")
+
+
 if __name__ == "__main__":
     import sys
-    if "--once" in sys.argv:
+    args = sys.argv[1:]
+
+    if "--loop-minutes" in args:
+        loop_minutes = int(args[args.index("--loop-minutes") + 1])
+        check_interval_minutes = 20  # default if not specified
+        if "--check-interval-minutes" in args:
+            check_interval_minutes = int(args[args.index("--check-interval-minutes") + 1])
+        git_commit_each_check = "--git-commit-each-check" in args
+        main_bounded_loop(loop_minutes, check_interval_minutes, git_commit_each_check)
+    elif "--once" in args:
         main_once()
     else:
         main_continuous()
