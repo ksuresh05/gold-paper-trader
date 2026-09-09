@@ -69,6 +69,13 @@ SESSION_FILTER_ENABLED = False
 SESSION_START_HOUR_GMT = 8    # London open, approx
 SESSION_END_HOUR_GMT = 21     # NY afternoon, approx -- covers London+NY overlap and NY session
 
+GIT_COMMIT_EACH_CHECK = True  # main_continuous() commits+pushes state/html after every check
+                                # when True, so a GitHub repo can serve as a viewable-without-SSH
+                                # source of truth for a host running the continuous loop directly
+                                # (e.g. a systemd service on a VM). Set False to disable (e.g. if
+                                # running somewhere without git/network access to push, or if you
+                                # only want to check state via direct SSH/file access).
+
 STATE_DIR = "state"
 STATE_FILE = os.path.join(STATE_DIR, "paper_state.json")
 TRADE_LOG_CSV = os.path.join(STATE_DIR, "trade_log.csv")
@@ -644,24 +651,49 @@ def main_continuous():
     """
     Continuous loop, started once (e.g. via a scheduled task at machine
     startup or once each morning) and left running -- same pattern as the
-    Upstox ratchet bot's intraday loop. Active only during the configured
-    GMT session window; outside that window it sleeps until the window
-    next opens rather than exiting, so it can be left running unattended.
-    An open position is still monitored for exits even though new entries
-    are session-gated -- risk management never pauses.
+    Upstox ratchet bot's intraday loop.
+
+    When SESSION_FILTER_ENABLED is True, the loop is only ACTIVE (checking)
+    during the configured GMT session window; outside that window it
+    sleeps until the window next opens rather than exiting, so it can be
+    left running unattended. An open position is still monitored for
+    exits even though new entries are session-gated -- risk management
+    never pauses.
+
+    When SESSION_FILTER_ENABLED is False (the current setting), the loop
+    checks continuously 24/7 -- consistent with entries also being allowed
+    at any hour (per process_new_bars()'s own SESSION_FILTER_ENABLED
+    check). Previously this outer loop ALWAYS gated on the GMT window
+    regardless of SESSION_FILTER_ENABLED, which silently limited checking
+    to 8am-9pm GMT even after entries were opened up to 24/7 -- fixed here
+    so both layers agree.
 
     POLL_INTERVAL_SECONDS controls how often it checks for a newly closed
     1h candle while active.
 
+    If GIT_COMMIT_EACH_CHECK is True, commits+pushes state/html after every
+    check (not just at the very end) -- keeps the GitHub repo's report
+    current as a viewable source of truth, without needing to SSH into
+    the host running this loop. Requires git to be configured with a
+    remote and credentials that can push without interactive auth (e.g.
+    a deploy key or credential helper) -- see _git_commit_and_push()'s
+    docstring for the non-fatal failure behavior if that's not set up.
+
     Requires a host that stays continuously awake (a paid always-on task,
-    or a machine that never sleeps). NOT suitable for a free-tier daily
-    scheduled task or a laptop that sleeps -- use main_once() for those.
+    a systemd service on a real VM, or a machine that never sleeps). NOT
+    suitable for a free-tier daily scheduled task or a laptop that sleeps
+    -- use main_once() for those.
     """
     POLL_INTERVAL_SECONDS = 20 * 60  # 20 minutes, within the requested 15-30 min range
 
     print("=== Gold Paper Trader -- continuous mode ===")
-    print(f"Active window: {SESSION_START_HOUR_GMT}:00-{SESSION_END_HOUR_GMT}:00 GMT, "
-          f"polling every {POLL_INTERVAL_SECONDS // 60} minutes while active.")
+    if SESSION_FILTER_ENABLED:
+        print(f"Active window: {SESSION_START_HOUR_GMT}:00-{SESSION_END_HOUR_GMT}:00 GMT, "
+              f"polling every {POLL_INTERVAL_SECONDS // 60} minutes while active.")
+    else:
+        print(f"Session filter OFF -- checking 24/7, every {POLL_INTERVAL_SECONDS // 60} minutes.")
+    if GIT_COMMIT_EACH_CHECK:
+        print("Git commit+push after each check: ENABLED.")
     print("Leave this window running. Press Ctrl+C to stop.\n")
 
     import time
@@ -669,7 +701,10 @@ def main_continuous():
         now = datetime.now(timezone.utc)
         current_hour = now.hour
 
-        if SESSION_START_HOUR_GMT <= current_hour < SESSION_END_HOUR_GMT:
+        in_active_window = (not SESSION_FILTER_ENABLED) or \
+                            (SESSION_START_HOUR_GMT <= current_hour < SESSION_END_HOUR_GMT)
+
+        if in_active_window:
             try:
                 run_once()
             except Exception as e:
@@ -679,6 +714,10 @@ def main_continuous():
                 # the next cycle.
                 print(f"ERROR during check: {e}")
                 print("Will retry on the next cycle.")
+
+            if GIT_COMMIT_EACH_CHECK:
+                _git_commit_and_push()
+
             print(f"Sleeping {POLL_INTERVAL_SECONDS // 60} minutes until next check...")
             time.sleep(POLL_INTERVAL_SECONDS)
         else:
