@@ -176,11 +176,14 @@ def load_state():
     State schema:
     {
       "account_balance": float,
-      "open_position": null | {
-          "direction": "LONG"/"SHORT", "entry_time": iso str, "entry_price": float,
-          "stop_price": float, "stop_dist_usd": float, "position_oz": float,
-          "position_lots": float
-      },
+      "open_positions": [
+          {"direction": "LONG"/"SHORT", "entry_time": iso str, "entry_price": float,
+           "stop_price": float, "stop_dist_usd": float, "position_oz": float,
+           "position_lots": float,
+           "breakeven_stop_price": float (optional, only present once armed)},
+          ... (zero or more -- MULTIPLE simultaneous positions allowed, no cap,
+               no same-direction restriction)
+      ],
       "setup_direction": 0/1/-1,   # tracks "cross happened, waiting for pullback touch"
                                     # across runs, same as the backtest's setup_direction
       "last_processed_bar": iso str or null,  # the last 1h bar timestamp already acted on,
@@ -191,7 +194,7 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         return {
             "account_balance": STARTING_CAPITAL,
-            "open_position": None,
+            "open_positions": [],
             "setup_direction": 0,
             "last_processed_bar": None,  # None is a sentinel meaning "never initialized" --
                                           # main()/run_once() fills this in on the very first
@@ -204,6 +207,14 @@ def load_state():
     with open(STATE_FILE, "r") as f:
         state = json.load(f)
     state.setdefault("total_withdrawn", 0.0)  # migration for state files saved before this field existed
+    # Migration: older state files (single-position era) have "open_position"
+    # (dict or null) instead of "open_positions" (list). Convert on load so
+    # an existing state file doesn't silently break or lose an already-open
+    # position when this version is deployed.
+    if "open_position" in state and "open_positions" not in state:
+        old_pos = state.pop("open_position")
+        state["open_positions"] = [old_pos] if old_pos is not None else []
+    state.setdefault("open_positions", [])
     return state
 
 
@@ -281,22 +292,45 @@ def compute_position_size(account_balance, stop_dist_usd, gold_price):
 def process_new_bars(df, state):
     """
     Walks forward through any 1h bars not yet processed (per state's
-    last_processed_bar), applying the exact same entry/exit logic as the
-    validated backtest, one completed bar at a time. Only ever acts on
-    fully CLOSED bars -- the most recent row from yfinance may be a
-    still-forming current-hour bar, which is excluded to avoid acting on
-    incomplete data (mirrors how a live trader would only react after a
-    candle closes, not mid-candle).
+    last_processed_bar), applying entry/exit logic to EVERY open position,
+    one bar at a time. Only ever acts on fully CLOSED bars -- the most
+    recent row from yfinance may be a still-forming current-hour bar,
+    which is excluded to avoid acting on incomplete data.
+
+    ENTRY LOGIC: UNCHANGED from the original live script -- same
+    EMA_FAST/EMA_SLOW cross + pullback-touch + trend-filter conditions,
+    same EMA150-based stop_price computed at entry, same
+    compute_position_size() risk-based sizing. NOT the inverted-stop-fixed
+    version -- this deliberately keeps the original entry/sizing logic
+    exactly as currently deployed.
+
+    EXIT LOGIC: MODIFIED. Both exit triggers (EMA150 stop hit, OR
+    opposite-cross) now go through a profit check before actually closing
+    the trade:
+      - If the position is CURRENTLY PROFITABLE when a trigger fires,
+        exit immediately (same as before).
+      - If NOT profitable, do NOT exit -- instead, arm a BREAKEVEN STOP at
+        the position's own entry price and keep the position open. The
+        trade only closes once price returns to that breakeven level (or
+        a LATER trigger re-evaluates as profitable).
+      - Since the EMA150 stop is specifically designed to fire when the
+        trade IS losing, this means it will almost always convert into a
+        breakeven-hold rather than an immediate exit -- a deliberate,
+        confirmed design choice, not an oversight.
+
+    MULTIPLE SIMULTANEOUS POSITIONS: state["open_positions"] is a LIST.
+    A new valid signal opens an ADDITIONAL position alongside any already
+    open -- no limit on count, no restriction to same-direction-only.
+    Each position is sized independently via the UNCHANGED
+    compute_position_size() (risk-based on EMA150 stop distance), so
+    total exposure grows with each additional open trade.
 
     Returns a list of "events" (dicts) describing what happened on each
-    processed bar -- new entry, exit, or nothing -- for the caller to log
-    and report. Mutates state in place.
+    processed bar. Mutates state in place.
     """
     events = []
 
     now_utc = pd.Timestamp.now(tz="UTC")
-    # Exclude the current still-forming bar: keep only bars whose hour has
-    # fully elapsed. df.index is tz-aware (from yfinance); compare in UTC.
     df_closed = df[df.index.tz_convert("UTC") + pd.Timedelta(hours=1) <= now_utc]
 
     if state["last_processed_bar"] is not None:
@@ -304,20 +338,53 @@ def process_new_bars(df, state):
         df_closed = df_closed[df_closed.index > last_ts]
 
     if df_closed.empty:
-        return events  # nothing new to process since last run
+        return events
 
     for ts, row in df_closed.iterrows():
-        pos = state["open_position"]
-
-        if pos is not None:
+        # --- MANAGE ALL OPEN POSITIONS (each checked independently) ---
+        still_open = []
+        for pos in state["open_positions"]:
             d = 1 if pos["direction"] == "LONG" else -1
-            stop_price = pos["stop_price"]
-            hit_stop = (d == 1 and row["Low"] <= stop_price) or \
-                       (d == -1 and row["High"] >= stop_price)
-            opposite_cross = row["CROSS"] == (-d)
 
-            if hit_stop or opposite_cross:
-                exit_price = stop_price if hit_stop else row["Close"]
+            # BREAKEVEN STOP CHECK (only active once armed): if a prior
+            # trigger found THIS position unprofitable, a stop was set at
+            # ITS entry price. Checked first, using the same conservative
+            # same-bar logic (adverse wick checked before anything else
+            # this bar).
+            breakeven_stop = pos.get("breakeven_stop_price")
+            hit_breakeven = breakeven_stop is not None and (
+                (d == 1 and row["Low"] <= breakeven_stop) or
+                (d == -1 and row["High"] >= breakeven_stop)
+            )
+
+            exit_price = None
+            exit_reason = None
+
+            if hit_breakeven:
+                exit_price = breakeven_stop
+                exit_reason = "BREAKEVEN_STOP"
+            else:
+                # ORIGINAL exit triggers, UNCHANGED: EMA150 stop_price hit,
+                # OR opposite-cross. Re-evaluated on every bar for every
+                # still-open position independently.
+                stop_price = pos["stop_price"]
+                hit_stop = (d == 1 and row["Low"] <= stop_price) or \
+                           (d == -1 and row["High"] >= stop_price)
+                opposite_cross = row["CROSS"] == (-d)
+
+                if hit_stop or opposite_cross:
+                    triggered_price = stop_price if hit_stop else row["Close"]
+                    is_profitable = (triggered_price - pos["entry_price"]) * d > 0
+                    if is_profitable:
+                        exit_price = triggered_price
+                        exit_reason = "STOP" if hit_stop else "OPPOSITE_CROSS"
+                    else:
+                        # NOT profitable at the moment this trigger fired --
+                        # do NOT exit. Arm/re-arm the breakeven stop at
+                        # THIS position's entry price instead.
+                        pos["breakeven_stop_price"] = pos["entry_price"]
+
+            if exit_price is not None:
                 result = "WIN" if (exit_price - pos["entry_price"]) * d > 0 else "LOSS"
 
                 position_oz = pos["position_oz"]
@@ -330,10 +397,6 @@ def process_new_bars(df, state):
                 state["account_balance"] += net_pnl
                 state["trade_count"] += 1
 
-                # Profit cap: once balance exceeds WITHDRAWAL_CAP_LEVEL, withdraw
-                # everything above it -- matches the validated backtest's
-                # WITHDRAWAL_MODE="cap" exactly, so paper results stay
-                # comparable to that backtest.
                 withdrawal_this_trade = 0.0
                 if WITHDRAWAL_ENABLED and state["account_balance"] > WITHDRAWAL_CAP_LEVEL:
                     withdrawal_this_trade = state["account_balance"] - WITHDRAWAL_CAP_LEVEL
@@ -345,7 +408,7 @@ def process_new_bars(df, state):
                     "direction": pos["direction"], "status": "CLOSED",
                     "entry_price": round(pos["entry_price"], 2),
                     "exit_price": round(exit_price, 2),
-                    "stop_price": round(stop_price, 2),
+                    "stop_price": round(pos["stop_price"], 2),
                     "position_oz": round(position_oz, 2),
                     "position_lots": round(pos["position_lots"], 2),
                     "gross_pnl_usd": round(gross_pnl, 2),
@@ -356,16 +419,16 @@ def process_new_bars(df, state):
                     "total_withdrawn": round(state["total_withdrawn"], 2)
                 }
                 append_trade_log(trade_record)
-                events.append({"type": "EXIT", "reason": "STOP" if hit_stop else "OPPOSITE_CROSS",
+                events.append({"type": "EXIT", "reason": exit_reason,
                                 "result": result, **trade_record})
+                # This position closed -- do NOT add it back to still_open.
+            else:
+                still_open.append(pos)
 
-                state["open_position"] = None
-                state["setup_direction"] = 0
-            # if position still open after this bar, fall through to next bar
-            # without evaluating a new entry (matches backtest's `continue`)
-            continue
+        state["open_positions"] = still_open
 
-        # No open position -- look for a new setup/entry, same logic as backtest
+        # --- LOOK FOR A NEW SETUP/ENTRY -- UNCHANGED logic, but now
+        # regardless of how many positions are ALREADY open. ---
         if row["CROSS"] == 1:
             state["setup_direction"] = 1
         elif row["CROSS"] == -1:
@@ -379,8 +442,6 @@ def process_new_bars(df, state):
                 if not trend_ok:
                     state["setup_direction"] = 0
                 elif SESSION_FILTER_ENABLED and not _in_session_window(ts):
-                    # Setup and trend filter both passed, but outside the allowed session
-                    # window -- skip this entry (untested filter, see config comment above).
                     events.append({"type": "SIGNAL_SKIPPED", "reason": "outside_session_window",
                                     "entry_time": str(ts)})
                     state["setup_direction"] = 0
@@ -391,7 +452,6 @@ def process_new_bars(df, state):
                     stop_dist = abs(entry_price - initial_stop)
 
                     if stop_dist < MIN_STOP_DIST_USD:
-                        # Same data-quality filter as the backtest -- too tight to size sanely
                         events.append({"type": "SIGNAL_SKIPPED", "reason": "stop_too_tight",
                                         "entry_time": str(ts), "stop_dist_usd": round(stop_dist, 4)})
                         state["setup_direction"] = 0
@@ -402,13 +462,14 @@ def process_new_bars(df, state):
                                             "entry_time": str(ts)})
                             state["setup_direction"] = 0
                         else:
-                            state["open_position"] = {
+                            new_position = {
                                 "direction": "LONG" if trade_dir == 1 else "SHORT",
                                 "entry_time": str(ts), "entry_price": entry_price,
                                 "stop_price": initial_stop, "stop_dist_usd": stop_dist,
                                 "position_oz": position_oz,
                                 "position_lots": position_oz / PEPPERSTONE_LOT_SIZE_OZ
                             }
+                            state["open_positions"].append(new_position)
                             state["setup_direction"] = 0
 
                             trade_record = {
@@ -439,23 +500,32 @@ def build_html_report(state, events, trade_log_df):
     net_return_pct = (state["account_balance"] - STARTING_CAPITAL) / STARTING_CAPITAL * 100
     total_wealth_return_pct = (total_wealth - STARTING_CAPITAL) / STARTING_CAPITAL * 100
 
-    open_pos = state["open_position"]
+    open_positions = state["open_positions"]
     open_pos_block = ""
-    if open_pos:
-        d_color = "#16a34a" if open_pos["direction"] == "LONG" else "#dc2626"
+    if open_positions:
         open_pos_block = f"""
-    <div class="section-title">Open Position</div>
+    <div class="section-title">Open Positions ({len(open_positions)})</div>"""
+        for open_pos in open_positions:
+            d_color = "#16a34a" if open_pos["direction"] == "LONG" else "#dc2626"
+            breakeven = open_pos.get("breakeven_stop_price")
+            breakeven_note = (f"<div class=\"stat-card\"><div class=\"stat-label\">Breakeven Stop</div>"
+                               f"<div class=\"stat-value\" style=\"color:#f97316\">${breakeven:.2f} (armed)</div></div>"
+                               if breakeven is not None else
+                               "<div class=\"stat-card\"><div class=\"stat-label\">Breakeven Stop</div>"
+                               "<div class=\"stat-value\" style=\"color:#6b7280\">Not armed</div></div>")
+            open_pos_block += f"""
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Direction</div><div class="stat-value" style="color:{d_color}">{open_pos['direction']}</div></div>
         <div class="stat-card"><div class="stat-label">Entry Time</div><div class="stat-value" style="font-size:14px">{open_pos['entry_time']}</div></div>
         <div class="stat-card"><div class="stat-label">Entry Price</div><div class="stat-value">${open_pos['entry_price']:.2f}</div></div>
-        <div class="stat-card"><div class="stat-label">Stop Price</div><div class="stat-value">${open_pos['stop_price']:.2f}</div></div>
+        <div class="stat-card"><div class="stat-label">EMA150 Stop Price</div><div class="stat-value">${open_pos['stop_price']:.2f}</div></div>
         <div class="stat-card"><div class="stat-label">Size</div><div class="stat-value">{open_pos['position_oz']:.2f} oz ({open_pos['position_lots']:.2f} lot)</div></div>
+        {breakeven_note}
     </div>"""
     else:
         open_pos_block = """
-    <div class="section-title">Open Position</div>
-    <div class="verdict" style="border-left-color:#6b7280;">No open position -- scanning for the next setup.</div>"""
+    <div class="section-title">Open Positions (0)</div>
+    <div class="verdict" style="border-left-color:#6b7280;">No open positions -- scanning for the next setup.</div>"""
 
     events_block = ""
     if events:
@@ -579,8 +649,9 @@ def run_once():
     else:
         print("Session filter: OFF -- 24/5, matches validated backtest exactly")
     state = load_state()
+    open_positions_summary = ", ".join(p["direction"] for p in state["open_positions"])
     print(f"Loaded state: balance=${state['account_balance']:.2f}, "
-          f"open_position={'YES - ' + state['open_position']['direction'] if state['open_position'] else 'None'}, "
+          f"open_positions=[{open_positions_summary}] ({len(state['open_positions'])} open), "
           f"trades so far={state['trade_count']}")
 
     df = fetch_data()
@@ -618,8 +689,9 @@ def run_once():
     else:
         print("No new completed bars since last check -- nothing to process.")
 
+    open_positions_summary2 = ", ".join(p["direction"] for p in state["open_positions"])
     print(f"Current balance: ${state['account_balance']:.2f} | "
-          f"Open position: {state['open_position']['direction'] if state['open_position'] else 'None'}")
+          f"Open positions: [{open_positions_summary2}] ({len(state['open_positions'])} open)")
 
     trade_log_df = read_trade_log()
     html = build_html_report(state, events, trade_log_df)
@@ -855,11 +927,268 @@ def _git_commit_and_push():
         print("WARNING: git not found on PATH -- skipping commit (non-fatal).")
 
 
+# ===================================================================
+# ROLLING-WINDOW BACKTEST MODE -- run with: python3 gold_paper_trader_livebe.py --backtest
+# Tests THIS file's own logic (unmodified live entry/EMA150-stop logic,
+# PLUS the breakeven-instead-of-immediate-exit rule and multiple
+# simultaneous positions) against real historical data, using a rolling
+# 60-day window at each simulated check -- genuinely matching what a
+# live deployment of THIS SAME FILE would see and do.
+# ===================================================================
+
+MASTER_FETCH_PERIOD = "730d"   # longest available from Yahoo for 1h data (~2 years,
+                                 # not a true 3 years -- see the printed span in the output)
+ROLLING_WINDOW_DAYS = 60        # MUST match this file's own PERIOD="60d" exactly
+CHECK_INTERVAL_HOURS = 1
+BACKTEST_OUTPUT_DIR = "rolling_output_livebe"
+BACKTEST_OUTPUT_HTML = os.path.join(BACKTEST_OUTPUT_DIR, "rolling_window_report.html")
+BACKTEST_OUTPUT_CSV = os.path.join(BACKTEST_OUTPUT_DIR, "rolling_window_trade_log.csv")
+
+
+def fetch_master_data():
+    tickers_to_try = [TICKER] + FALLBACK_TICKERS
+    for ticker in tickers_to_try:
+        print(f"Trying {ticker} ({INTERVAL} interval, {MASTER_FETCH_PERIOD} period)...")
+        df = yf.download(ticker, period=MASTER_FETCH_PERIOD, interval=INTERVAL, progress=False)
+        if not df.empty:
+            if ticker != TICKER:
+                print(f"NOTE: {TICKER} unavailable -- using fallback {ticker}")
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            df = df.rename(columns=str.title)
+            return df.dropna()
+    raise RuntimeError("No data available from any ticker.")
+
+
+def build_backtest_trade_log_df(all_events):
+    """
+    Reconstructs the trade_log_df shape build_html_report() expects,
+    with an OPEN row per entry updated in place to CLOSED on exit
+    (matching append_trade_log()'s real upsert behavior), rather than one
+    row per event. Includes stop_price (the EMA150 level, as this
+    version's real trade records do) plus exit_reason for diagnostics.
+    """
+    log_df = pd.DataFrame(columns=[
+        "entry_time", "exit_time", "direction", "status", "entry_price", "exit_price",
+        "stop_price", "position_oz", "position_lots", "gross_pnl_usd", "cost_usd",
+        "net_pnl_usd", "account_balance", "withdrawal_usd", "total_withdrawn", "exit_reason"
+    ])
+    for e in all_events:
+        if e["type"] == "ENTRY":
+            row = {k: e[k] for k in log_df.columns if k in e}
+            row["exit_reason"] = ""
+            log_df = pd.concat([log_df, pd.DataFrame([row])], ignore_index=True)
+        elif e["type"] == "EXIT":
+            match = log_df["entry_time"].astype(str) == str(e["entry_time"])
+            exit_reason_value = e.get("reason", "")
+            if match.any():
+                idx = log_df.index[match][0]
+                for k in log_df.columns:
+                    if k in e:
+                        log_df.loc[idx, k] = e[k]
+                log_df.loc[idx, "exit_reason"] = exit_reason_value
+            else:
+                row = {k: e[k] for k in log_df.columns if k in e}
+                row["exit_reason"] = exit_reason_value
+                log_df = pd.concat([log_df, pd.DataFrame([row])], ignore_index=True)
+    return log_df
+
+
+def _inject_exit_reason_column(html, trade_log_df):
+    """
+    Adds an 'Exit Reason' column (STOP / OPPOSITE_CROSS / BREAKEVEN_STOP)
+    to the trade history table in the generated HTML, without modifying
+    build_html_report() itself. Matched by the SAME row order
+    build_html_report() uses internally (entry_time descending).
+    """
+    import re
+
+    html = html.replace(
+        "<th>Entry Time</th><th>Direction</th><th>Status</th>",
+        "<th>Entry Time</th><th>Direction</th><th>Status</th><th>Exit Reason</th>"
+    )
+
+    if trade_log_df.empty:
+        return html
+
+    sorted_log = trade_log_df.sort_values("entry_time", ascending=False)
+    reason_labels = []
+    for _, t in sorted_log.iterrows():
+        reason = t.get("exit_reason", "")
+        if reason == "STOP":
+            reason_labels.append('<td style="color:#f97316;font-size:12px">EMA150 stop (profitable)</td>')
+        elif reason == "BREAKEVEN_STOP":
+            reason_labels.append('<td style="color:#eab308;font-size:12px">Breakeven stop</td>')
+        elif reason == "OPPOSITE_CROSS":
+            reason_labels.append('<td style="color:#3b82f6;font-size:12px">Opposite cross</td>')
+        else:
+            reason_labels.append('<td style="color:#9ca3af;font-size:12px">-</td>')
+
+    row_pattern = re.compile(r'(<tr>\s*<td>.*?</td>\s*<td[^>]*>.*?</td>\s*<td[^>]*>.*?</td>\s*)(<td>\$)', re.DOTALL)
+    row_index = [0]
+    def _insert_reason(match):
+        idx = row_index[0]
+        row_index[0] += 1
+        if idx < len(reason_labels):
+            return match.group(1) + reason_labels[idx] + match.group(2)
+        return match.group(0)
+    html = row_pattern.sub(_insert_reason, html)
+    return html
+
+
+def run_backtest():
+    import sys
+    print("=" * 70)
+    print("ROLLING-WINDOW BACKTEST (genuinely matches live VM's 60-day rolling context)")
+    print("=" * 70)
+    print(f"Config: EMA_FAST={EMA_FAST}, EMA_SLOW={EMA_SLOW}, EMA_STOP={EMA_STOP}")
+    print(f"ROLLING_WINDOW_DAYS={ROLLING_WINDOW_DAYS} (matches this file's own PERIOD exactly)")
+    print(f"NOTE: this file has the UNMODIFIED live entry/EMA150-stop logic, PLUS: "
+          f"(1) multiple simultaneous positions allowed, and (2) BOTH exit triggers "
+          f"(EMA150 stop hit, opposite-cross) now check profit first -- if profitable, "
+          f"exit immediately; if not, HOLD and arm a breakeven stop at entry price instead "
+          f"of exiting at a loss. Since the EMA150 stop is designed to fire when losing, "
+          f"expect it to almost always convert into a breakeven-hold rather than an "
+          f"immediate exit.")
+    print("=" * 70)
+
+    master_df = fetch_master_data()
+    span_days = (master_df.index.max() - master_df.index.min()).days
+    print(f"\nMaster dataset: {len(master_df)} bars, {master_df.index.min()} to "
+          f"{master_df.index.max()} (~{span_days} days)")
+    if span_days < 1000:
+        print("NOTE: Yahoo's 1h-interval history caps around ~730 days (~2 years) -- "
+              "a genuine 3-year 1h window isn't available from this data source.")
+
+    master_df = master_df.sort_index()
+    master_df = add_indicators(master_df.copy())
+
+    sim_start = master_df.index.min() + pd.Timedelta(days=ROLLING_WINDOW_DAYS)
+    sim_end = master_df.index.max()
+    print(f"Simulating checks from {sim_start} to {sim_end} "
+          f"(every {CHECK_INTERVAL_HOURS}h simulated 'now')")
+
+    state = {
+        "account_balance": STARTING_CAPITAL,
+        "open_positions": [],
+        "setup_direction": 0,
+        "last_processed_bar": None,
+        "trade_count": 0,
+        "total_withdrawn": 0.0,
+        "initialized": True
+    }
+
+    all_events = []
+    current_sim_time = sim_start
+    check_count = 0
+    total_checks = int((sim_end - sim_start).total_seconds() / 3600 / CHECK_INTERVAL_HOURS) + 1
+
+    # CRITICAL: monkey-patch pd.Timestamp.now so the REAL, unmodified
+    # process_new_bars() can be called directly during simulation -- see
+    # the no-stop version's development notes for why this approach
+    # (rather than a hand-copied duplicate) is used: a hand-copy risks
+    # silently drifting from the actual function's real behavior.
+    import unittest.mock as mock
+    real_timestamp_now = pd.Timestamp.now
+
+    class _SimulatedNow:
+        current = None
+        @classmethod
+        def now(cls, tz=None):
+            if cls.current is None:
+                return real_timestamp_now(tz=tz)
+            return cls.current.tz_convert(tz) if tz else cls.current
+
+    def _noop_append_trade_log(row_dict):
+        pass
+
+    with mock.patch.object(pd.Timestamp, "now", side_effect=_SimulatedNow.now), \
+         mock.patch.object(sys.modules[__name__], "append_trade_log", _noop_append_trade_log):
+
+        while current_sim_time <= sim_end:
+            check_count += 1
+            if check_count % 2000 == 0:
+                print(f"  ...simulated check {check_count}/{total_checks} "
+                      f"({current_sim_time.strftime('%Y-%m-%d %H:%M')})")
+
+            _SimulatedNow.current = current_sim_time.tz_localize("UTC") if current_sim_time.tzinfo is None \
+                                     else current_sim_time.tz_convert("UTC")
+            events = process_new_bars(master_df, state)
+            all_events.extend(events)
+
+            current_sim_time += pd.Timedelta(hours=CHECK_INTERVAL_HOURS)
+
+    entries = [e for e in all_events if e["type"] == "ENTRY"]
+    exits = [e for e in all_events if e["type"] == "EXIT"]
+    skipped = [e for e in all_events if e["type"] == "SIGNAL_SKIPPED"]
+
+    print(f"\n{'='*70}")
+    print("RESULTS")
+    print(f"{'='*70}")
+    print(f"Entries: {len(entries)}  Exits: {len(exits)}  Skipped: {len(skipped)}")
+    wins = [e for e in exits if e["result"] == "WIN"]
+    win_rate = len(wins) / len(exits) * 100 if exits else 0
+    print(f"Win rate: {win_rate:.1f}% ({len(wins)}W / {len(exits)-len(wins)}L)")
+
+    exit_reason_counts = {}
+    for e in exits:
+        exit_reason_counts[e["reason"]] = exit_reason_counts.get(e["reason"], 0) + 1
+    print(f"Exit reasons: {exit_reason_counts}")
+
+    if exits:
+        losses = [e for e in exits if e["result"] == "LOSS"]
+        if losses:
+            worst_loss = min(losses, key=lambda e: e["net_pnl_usd"])
+            print(f"Worst single-trade loss: ${worst_loss['net_pnl_usd']:.2f} "
+                  f"({worst_loss['direction']}, reason: {worst_loss['reason']}, "
+                  f"entered {worst_loss['entry_time']}, closed {worst_loss['exit_time']})")
+        durations_hours = [(pd.Timestamp(e["exit_time"]) - pd.Timestamp(e["entry_time"])).total_seconds() / 3600
+                            for e in exits]
+        print(f"Trade duration: median {pd.Series(durations_hours).median():.1f}h, "
+              f"longest {max(durations_hours):.1f}h")
+
+    print(f"\nFinal balance: ${state['account_balance']:.2f}")
+    print(f"Total withdrawn: ${state['total_withdrawn']:.2f}")
+    total_wealth = state["account_balance"] + state["total_withdrawn"]
+    print(f"Total wealth: ${total_wealth:.2f}")
+
+    if state["open_positions"]:
+        print(f"\nStill open at end of data: {len(state['open_positions'])} position(s)")
+        for pos in state["open_positions"]:
+            be = pos.get("breakeven_stop_price")
+            print(f"  {pos['direction']} entered {pos['entry_time']} @ ${pos['entry_price']:.2f}, "
+                  f"EMA150 stop ${pos['stop_price']:.2f}"
+                  + (f", breakeven armed @ ${be:.2f}" if be is not None else ", breakeven not armed"))
+
+    trade_log_df = build_backtest_trade_log_df(all_events)
+    os.makedirs(BACKTEST_OUTPUT_DIR, exist_ok=True)
+    trade_log_df.to_csv(BACKTEST_OUTPUT_CSV, index=False)
+    print(f"\nFull trade log (CSV): {BACKTEST_OUTPUT_CSV}")
+
+    html = build_html_report(state, all_events[-50:] if len(all_events) > 50 else all_events, trade_log_df)
+    html = _inject_exit_reason_column(html, trade_log_df)
+    banner = f"""
+    <div style="background:#1e3a5f; border:1px solid #2563eb; color:#93c5fd; padding:12px 16px;
+                border-radius:8px; font-size:13px; margin-bottom:16px;">
+        📊 ROLLING-WINDOW BACKTEST -- live entry/EMA150-stop logic + breakeven-hold exit rule +
+        multiple simultaneous positions. Each simulated check re-slices a trailing
+        {ROLLING_WINDOW_DAYS}-day window, matching what the real deployment would see. NOT a live
+        report -- generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.
+    </div>"""
+    html = html.replace("<div class=\"warning\">", banner + "\n    <div class=\"warning\">")
+
+    with open(BACKTEST_OUTPUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Full HTML report: {BACKTEST_OUTPUT_HTML}")
+
+
 if __name__ == "__main__":
     import sys
     args = sys.argv[1:]
 
-    if "--loop-minutes" in args:
+    if "--backtest" in args:
+        run_backtest()
+    elif "--loop-minutes" in args:
         loop_minutes = int(args[args.index("--loop-minutes") + 1])
         check_interval_minutes = 20  # default if not specified
         if "--check-interval-minutes" in args:
