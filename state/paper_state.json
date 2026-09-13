@@ -1,6 +1,6 @@
 {
   "account_balance": 1000.0,
-  "open_position": null,
+  "open_positions": [],
   "setup_direction": 0,
   "last_processed_bar": "2026-09-11 16:00:00-04:00",
   "trade_count": 0,
