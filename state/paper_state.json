@@ -1,9 +1,9 @@
 {
-  "account_balance": 996.7373456525529,
+  "account_balance": 1000.0,
   "open_position": null,
   "setup_direction": 0,
   "last_processed_bar": "2026-09-11 16:00:00-04:00",
-  "trade_count": 2,
+  "trade_count": 0,
   "total_withdrawn": 0.0,
   "initialized": true
 }
