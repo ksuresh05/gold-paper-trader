@@ -1,2 +1,2 @@
 entry_time,exit_time,direction,status,entry_price,exit_price,stop_price,position_oz,position_lots,gross_pnl_usd,cost_usd,net_pnl_usd,account_balance,withdrawal_usd,total_withdrawn
-2026-09-20 22:00:00-04:00,,SHORT,OPEN,4401.5,,4389.6,1.0,0.01,,,,1000.0,0.0,0.0
+2026-09-20 22:00:00-04:00,2026-09-21 00:00:00-04:00,SHORT,CLOSED,4401.5,4389.6,4389.6,1.0,0.01,11.9,1.0,10.9,1010.9,0.0,0.0
