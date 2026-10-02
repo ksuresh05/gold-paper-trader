@@ -1,19 +1,9 @@
 {
-  "account_balance": 1280.1944550009202,
-  "open_positions": [
-    {
-      "direction": "LONG",
-      "entry_time": "2026-10-02 03:00:00-04:00",
-      "entry_price": 4214.7001953125,
-      "stop_price": 4236.521487606883,
-      "stop_dist_usd": 21.821292294383056,
-      "position_oz": 1.0,
-      "position_lots": 0.01
-    }
-  ],
+  "account_balance": 1301.0157472953033,
+  "open_positions": [],
   "setup_direction": 0,
-  "last_processed_bar": "2026-10-02 03:00:00-04:00",
-  "trade_count": 7,
+  "last_processed_bar": "2026-10-02 04:00:00-04:00",
+  "trade_count": 8,
   "total_withdrawn": 0.0,
   "initialized": true
 }
