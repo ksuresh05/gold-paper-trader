@@ -8,11 +8,12 @@
       "stop_price": 4073.3420158582658,
       "stop_dist_usd": 19.642064686390768,
       "position_oz": 1.0,
-      "position_lots": 0.01
+      "position_lots": 0.01,
+      "breakeven_stop_price": 4053.699951171875
     }
   ],
   "setup_direction": 0,
-  "last_processed_bar": "2026-10-28 13:00:00-04:00",
+  "last_processed_bar": "2026-10-28 14:00:00-04:00",
   "trade_count": 20,
   "total_withdrawn": 0.0,
   "initialized": true
