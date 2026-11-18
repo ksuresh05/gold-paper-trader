@@ -107,6 +107,29 @@ MARGIN_SAFETY_FRACTION = 0.20
 ROUND_TRIP_COST_PER_OZ = 1.00
 MIN_STOP_DIST_USD = 0.50
 
+# ------------------------- PYRAMID ADD CONFIG ------------------------
+# From the validated parameter sweep: configuration #10 (conservative).
+# When a fresh entry's direction already has one or more open positions AND
+# the EMA7/15 gap has widened to >= PYRAMID_GAP_MULTIPLE x the gap at the
+# original fresh entry, open an additional tranche (sized with the SAME 2%
+# risk formula on the CURRENT EMA150 stop distance), subject to:
+#   - at most PYRAMID_MAX_ADDS adds per original fresh entry
+#   - at least PYRAMID_COOLDOWN_HOURS between adds (and between original
+#     entry and the first add)
+#   - trend confirmation (close still on correct side of EMA_SLOW)
+# Each add becomes an INDEPENDENT tranche in state["open_positions"] with
+# its own entry price, its own EMA150 stop, its own breakeven-hold. The
+# existing exit logic (process_new_bars) handles every tranche identically.
+#
+# GRANDFATHERING: positions already open when this feature is first
+# activated are NOT touched by pyramid logic (their direction's pyramid
+# metadata stays uninitialized until they close and a brand-new fresh
+# entry fires). This keeps the first upgrade run safe.
+PYRAMID_ENABLED = True
+PYRAMID_GAP_MULTIPLE = 1.5
+PYRAMID_MAX_ADDS = 2
+PYRAMID_COOLDOWN_HOURS = 6
+
 
 def _try_fetch(ticker, retries=2, backoff_sec=3):
     import time
@@ -215,6 +238,18 @@ def load_state():
         old_pos = state.pop("open_position")
         state["open_positions"] = [old_pos] if old_pos is not None else []
     state.setdefault("open_positions", [])
+    # Migration for pyramid-add feature. If no pyramid metadata exists,
+    # initialize it as "uninitialized" for both directions -- any positions
+    # already open at this point are GRANDFATHERED (they stay managed by
+    # the baseline logic only; pyramid adds never attach to them). New
+    # pyramid cycles start only when all positions in a direction close
+    # and a brand-new fresh entry fires in that direction.
+    state.setdefault("pyramid", {
+        "LONG":  {"orig_gap": None, "last_add_ts": None, "adds": 0, "fresh_entry_oz": None},
+        "SHORT": {"orig_gap": None, "last_add_ts": None, "adds": 0, "fresh_entry_oz": None},
+    })
+    for d in ("LONG", "SHORT"):
+        state["pyramid"].setdefault(d, {"orig_gap": None, "last_add_ts": None, "adds": 0, "fresh_entry_oz": None})
     return state
 
 
@@ -288,6 +323,95 @@ def compute_position_size(account_balance, stop_dist_usd, gold_price):
 
 
 # ------------------------- SIGNAL PROCESSING ------------------------
+
+def _reset_pyramid_if_direction_flat(state):
+    """When all positions in a direction have closed, clear that direction's
+    pyramid metadata so the next fresh entry starts a new pyramid cycle."""
+    for direction in ("LONG", "SHORT"):
+        if not any(p["direction"] == direction for p in state["open_positions"]):
+            state["pyramid"][direction] = {"orig_gap": None, "last_add_ts": None,
+                                             "adds": 0, "fresh_entry_oz": None}
+
+
+def _try_pyramid_adds(row, ts, state, events):
+    """For each direction with an ACTIVE pyramid cycle (orig_gap set at the
+    original fresh entry), check whether this bar meets the add criteria and
+    open a new tranche if so.
+
+    Add criteria (configuration #10 from the validated sweep):
+      - at least PYRAMID_COOLDOWN_HOURS since original entry or last add
+      - fewer than PYRAMID_MAX_ADDS adds already in this cycle
+      - current |EMA_FAST - EMA_SLOW| >= PYRAMID_GAP_MULTIPLE * orig_gap
+      - trend confirmation (close still on correct side of EMA_SLOW)
+      - standard stop-distance / sizing viability checks
+    A tranche carries is_add=True in its position dict and in the trade log
+    so it's distinguishable from a fresh entry in the report / audit trail.
+    """
+    if not PYRAMID_ENABLED:
+        return
+    for direction in ("LONG", "SHORT"):
+        d = 1 if direction == "LONG" else -1
+        same_dir_open = [p for p in state["open_positions"] if p["direction"] == direction]
+        if not same_dir_open:
+            continue
+        meta = state["pyramid"][direction]
+        if meta["orig_gap"] is None or meta["orig_gap"] <= 0:
+            # grandfathered: no pyramid cycle active for this direction
+            continue
+        if meta["adds"] >= PYRAMID_MAX_ADDS:
+            continue
+        # cooldown check (timestamp-based so it survives service restarts)
+        if meta["last_add_ts"] is not None:
+            hours_since = (pd.Timestamp(ts) - pd.Timestamp(meta["last_add_ts"])).total_seconds() / 3600.0
+            if hours_since < PYRAMID_COOLDOWN_HOURS:
+                continue
+        # gap-widening trigger
+        current_gap = abs(row["EMA_FAST"] - row["EMA_SLOW"])
+        if current_gap < meta["orig_gap"] * PYRAMID_GAP_MULTIPLE:
+            continue
+        # trend confirmation
+        if d == 1 and row["Close"] <= row["EMA_SLOW"]:
+            continue
+        if d == -1 and row["Close"] >= row["EMA_SLOW"]:
+            continue
+        # sizing viability
+        entry_price = row["Close"]
+        initial_stop = row["EMA_STOP"]
+        stop_dist = abs(entry_price - initial_stop)
+        if stop_dist < MIN_STOP_DIST_USD:
+            continue
+        position_oz = compute_position_size(state["account_balance"], stop_dist, entry_price)
+        if position_oz <= 0:
+            continue
+        # open the tranche (independent position; existing exit logic handles it)
+        new_position = {
+            "direction": direction,
+            "entry_time": str(ts),
+            "entry_price": entry_price,
+            "stop_price": initial_stop, "stop_dist_usd": stop_dist,
+            "position_oz": position_oz,
+            "position_lots": position_oz / PEPPERSTONE_LOT_SIZE_OZ,
+            "is_add": True,
+        }
+        state["open_positions"].append(new_position)
+        meta["adds"] += 1
+        meta["last_add_ts"] = str(ts)
+        trade_record = {
+            "entry_time": str(ts), "exit_time": "",
+            "direction": direction, "status": "OPEN",
+            "entry_price": round(entry_price, 2), "exit_price": "",
+            "stop_price": round(initial_stop, 2),
+            "position_oz": round(position_oz, 2),
+            "position_lots": round(position_oz / PEPPERSTONE_LOT_SIZE_OZ, 2),
+            "gross_pnl_usd": "", "cost_usd": "", "net_pnl_usd": "",
+            "account_balance": round(state["account_balance"], 2),
+            "withdrawal_usd": 0.0, "total_withdrawn": round(state["total_withdrawn"], 2),
+            "is_add": True, "add_number": meta["adds"],
+            "gap_ratio_vs_entry": round(current_gap / meta["orig_gap"], 2),
+        }
+        append_trade_log(trade_record)
+        events.append({"type": "ADD", **trade_record})
+
 
 def process_new_bars(df, state):
     """
@@ -426,6 +550,9 @@ def process_new_bars(df, state):
                 still_open.append(pos)
 
         state["open_positions"] = still_open
+        # If a direction is now flat, end its pyramid cycle so the next
+        # fresh entry in that direction starts a new cycle cleanly.
+        _reset_pyramid_if_direction_flat(state)
 
         # --- LOOK FOR A NEW SETUP/ENTRY -- UNCHANGED logic, but now
         # regardless of how many positions are ALREADY open. ---
@@ -462,13 +589,28 @@ def process_new_bars(df, state):
                                             "entry_time": str(ts)})
                             state["setup_direction"] = 0
                         else:
+                            direction_label = "LONG" if trade_dir == 1 else "SHORT"
                             new_position = {
-                                "direction": "LONG" if trade_dir == 1 else "SHORT",
+                                "direction": direction_label,
                                 "entry_time": str(ts), "entry_price": entry_price,
                                 "stop_price": initial_stop, "stop_dist_usd": stop_dist,
                                 "position_oz": position_oz,
-                                "position_lots": position_oz / PEPPERSTONE_LOT_SIZE_OZ
+                                "position_lots": position_oz / PEPPERSTONE_LOT_SIZE_OZ,
+                                "is_add": False,
                             }
+                            # PYRAMID: start a new cycle ONLY if this is the first
+                            # position in this direction. If other positions in this
+                            # direction are already open, they're either grandfathered
+                            # or part of an existing cycle -- don't overwrite metadata.
+                            if PYRAMID_ENABLED and not any(
+                                p["direction"] == direction_label for p in state["open_positions"]
+                            ):
+                                state["pyramid"][direction_label] = {
+                                    "orig_gap": abs(row["EMA_FAST"] - row["EMA_SLOW"]),
+                                    "last_add_ts": str(ts),
+                                    "adds": 0,
+                                    "fresh_entry_oz": position_oz,
+                                }
                             state["open_positions"].append(new_position)
                             state["setup_direction"] = 0
 
@@ -487,6 +629,10 @@ def process_new_bars(df, state):
                             append_trade_log(trade_record)
                             events.append({"type": "ENTRY", **trade_record})
 
+        # --- PYRAMID ADDS: after fresh-entry handling, see if any open
+        # position's direction should get an extra tranche on this bar.
+        _try_pyramid_adds(row, ts, state, events)
+
         state["last_processed_bar"] = str(ts)
 
     return events
@@ -494,18 +640,35 @@ def process_new_bars(df, state):
 
 # ------------------------- REPORTING ------------------------
 
-def build_html_report(state, events, trade_log_df):
+def build_html_report(state, events, trade_log_df, last_price=None, last_bar_time=None):
     total_withdrawn = state.get("total_withdrawn", 0.0)
     total_wealth = state["account_balance"] + total_withdrawn
     net_return_pct = (state["account_balance"] - STARTING_CAPITAL) / STARTING_CAPITAL * 100
     total_wealth_return_pct = (total_wealth - STARTING_CAPITAL) / STARTING_CAPITAL * 100
 
+    # ------- mark-to-market: mark every open position against the latest available 1h close -------
+    # last_price is passed in from run_once() (latest bar's Close that yfinance returned this cycle).
+    # If unavailable for any reason, we fall back to no mark-to-market -- cards just show "n/a".
     open_positions = state["open_positions"]
+    total_unrealized = 0.0
+    position_marks = []   # per-position [(unrealized_usd, unrealized_pct_of_balance)]
+    if last_price is not None:
+        for p in open_positions:
+            if p["direction"] == "LONG":
+                u = (last_price - p["entry_price"]) * p["position_oz"]
+            else:
+                u = (p["entry_price"] - last_price) * p["position_oz"]
+            position_marks.append((u, (u / state["account_balance"] * 100) if state["account_balance"] else 0.0))
+            total_unrealized += u
+
+    equity_incl_open = state["account_balance"] + total_unrealized
+    equity_color = "#16a34a" if total_unrealized >= 0 else "#dc2626"
+
     open_pos_block = ""
     if open_positions:
         open_pos_block = f"""
     <div class="section-title">Open Positions ({len(open_positions)})</div>"""
-        for open_pos in open_positions:
+        for idx, open_pos in enumerate(open_positions):
             d_color = "#16a34a" if open_pos["direction"] == "LONG" else "#dc2626"
             breakeven = open_pos.get("breakeven_stop_price")
             breakeven_note = (f"<div class=\"stat-card\"><div class=\"stat-label\">Breakeven Stop</div>"
@@ -513,13 +676,28 @@ def build_html_report(state, events, trade_log_df):
                                if breakeven is not None else
                                "<div class=\"stat-card\"><div class=\"stat-label\">Breakeven Stop</div>"
                                "<div class=\"stat-value\" style=\"color:#6b7280\">Not armed</div></div>")
+            # mark-to-market cards for THIS position
+            if position_marks and idx < len(position_marks):
+                u_usd, u_pct = position_marks[idx]
+                u_color = "#16a34a" if u_usd >= 0 else "#dc2626"
+                current_price_card = (f"<div class=\"stat-card\"><div class=\"stat-label\">Current Price</div>"
+                                       f"<div class=\"stat-value\">${last_price:,.2f}</div></div>")
+                unrealized_card = (f"<div class=\"stat-card\"><div class=\"stat-label\">Unrealized P&amp;L</div>"
+                                    f"<div class=\"stat-value\" style=\"color:{u_color}\">${u_usd:+,.2f} ({u_pct:+.2f}%)</div></div>")
+            else:
+                current_price_card = ("<div class=\"stat-card\"><div class=\"stat-label\">Current Price</div>"
+                                       "<div class=\"stat-value\" style=\"color:#6b7280\">n/a</div></div>")
+                unrealized_card = ("<div class=\"stat-card\"><div class=\"stat-label\">Unrealized P&amp;L</div>"
+                                    "<div class=\"stat-value\" style=\"color:#6b7280\">n/a</div></div>")
             open_pos_block += f"""
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Direction</div><div class="stat-value" style="color:{d_color}">{open_pos['direction']}</div></div>
         <div class="stat-card"><div class="stat-label">Entry Time</div><div class="stat-value" style="font-size:14px">{open_pos['entry_time']}</div></div>
         <div class="stat-card"><div class="stat-label">Entry Price</div><div class="stat-value">${open_pos['entry_price']:.2f}</div></div>
+        {current_price_card}
         <div class="stat-card"><div class="stat-label">EMA150 Stop Price</div><div class="stat-value">${open_pos['stop_price']:.2f}</div></div>
         <div class="stat-card"><div class="stat-label">Size</div><div class="stat-value">{open_pos['position_oz']:.2f} oz ({open_pos['position_lots']:.2f} lot)</div></div>
+        {unrealized_card}
         {breakeven_note}
     </div>"""
     else:
@@ -533,6 +711,12 @@ def build_html_report(state, events, trade_log_df):
         for e in events:
             if e["type"] == "ENTRY":
                 event_items += f"<li>ENTRY: {e['direction']} at ${e['entry_price']:.2f}, bar {e['entry_time']}</li>"
+            elif e["type"] == "ADD":
+                add_num = e.get("add_number", "?")
+                gap_ratio = e.get("gap_ratio_vs_entry", "?")
+                event_items += (f"<li style='color:#a78bfa'>PYRAMID ADD #{add_num}: {e['direction']} "
+                                 f"at ${e['entry_price']:.2f}, {e['position_oz']:.2f} oz, "
+                                 f"gap ratio {gap_ratio}x, bar {e['entry_time']}</li>")
             elif e["type"] == "EXIT":
                 color = "#16a34a" if e["result"] == "WIN" else "#dc2626"
                 event_items += (f"<li style='color:{color}'>EXIT ({e['reason']}, {e['result']}): "
@@ -559,9 +743,11 @@ def build_html_report(state, events, trade_log_df):
             withdrawal_val = t.get("withdrawal_usd", 0.0)
             withdrawal_str = (f"${float(withdrawal_val):.2f}"
                                if str(withdrawal_val) not in ("", "nan") and float(withdrawal_val) > 0 else "-")
+            is_add_row = str(t.get("is_add", "")).lower() in ("true", "1")
+            add_badge = ' <span style="background:#4c1d95;color:#ddd6fe;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">ADD</span>' if is_add_row else ''
             trade_rows += f"""
         <tr>
-            <td>{t['entry_time']}</td>
+            <td>{t['entry_time']}{add_badge}</td>
             <td style="color:{dir_color};font-weight:600">{t['direction']}</td>
             <td style="color:{status_color};font-weight:600">{t['status']}</td>
             <td>${float(t['entry_price']):.2f}</td>
@@ -601,7 +787,8 @@ def build_html_report(state, events, trade_log_df):
     <div class="subtitle">EMA{EMA_FAST}/{EMA_SLOW} cross + pullback, EMA{EMA_STOP} fixed stop, {RISK_PCT:.0f}% risk, 1:{PEPPERSTONE_LEVERAGE} leverage @ {MARGIN_SAFETY_FRACTION*100:.0f}% safety cap</div>
     <div class="subtitle">{'Session filter ON: new entries only ' + str(SESSION_START_HOUR_GMT) + '-' + str(SESSION_END_HOUR_GMT) + ' GMT (untested vs backtest -- London/NY hours)' if SESSION_FILTER_ENABLED else 'Session filter OFF: 24/5, matches validated backtest exactly'}</div>
     <div class="subtitle" style="color:#f59e0b; font-weight:600;">Config: EMA_FAST={EMA_FAST}, EMA_SLOW={EMA_SLOW}, EMA_STOP={EMA_STOP}, STARTING_CAPITAL=${STARTING_CAPITAL:.0f}, SIZING_EQUITY_CAP=${SIZING_EQUITY_CAP:,.0f} -- check this matches the backtest you're comparing against</div>
-    <div class="subtitle">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
+    <div class="subtitle" style="color:#a78bfa;">{'Pyramid ADDS: ON (gap &ge; ' + str(PYRAMID_GAP_MULTIPLE) + 'x original-entry gap, max ' + str(PYRAMID_MAX_ADDS) + ' adds / cycle, cooldown ' + str(PYRAMID_COOLDOWN_HOURS) + 'h) -- config #10 from validated sweep' if PYRAMID_ENABLED else 'Pyramid ADDS: OFF'}</div>
+    <div class="subtitle">Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}{(' | Latest XAUUSD bar: ' + str(last_bar_time) + ' @ $' + format(last_price, ',.2f')) if last_price is not None else ''}</div>
 
     <div class="warning">
         ⚠ This is a PAPER TRACKER, not an auto-trader. It tells you what to do based on completed
@@ -613,6 +800,8 @@ def build_html_report(state, events, trade_log_df):
     <div class="section-title">Account Status</div>
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-label">Account Balance</div><div class="stat-value">${state['account_balance']:.2f}</div></div>
+        <div class="stat-card"><div class="stat-label">Equity (incl. open)</div><div class="stat-value" style="color:{equity_color}">${equity_incl_open:,.2f}</div></div>
+        <div class="stat-card"><div class="stat-label">Current XAU Price</div><div class="stat-value">{('$' + format(last_price, ',.2f')) if last_price is not None else 'n/a'}</div></div>
         <div class="stat-card"><div class="stat-label">Total Withdrawn</div><div class="stat-value">${total_withdrawn:.2f}</div></div>
         <div class="stat-card"><div class="stat-label">Total Wealth Return</div><div class="stat-value">{total_wealth_return_pct:.2f}%</div></div>
         <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value">{state['trade_count']}</div></div>
@@ -680,6 +869,10 @@ def run_once():
                 print(f"  -> ENTER {e['direction']} at ${e['entry_price']:.2f}, "
                       f"size {e['position_oz']:.2f} oz ({e['position_lots']:.2f} lot), "
                       f"stop ${e['stop_price']:.2f}, bar {e['entry_time']}")
+            elif e["type"] == "ADD":
+                print(f"  -> PYRAMID ADD #{e.get('add_number','?')}: {e['direction']} at ${e['entry_price']:.2f}, "
+                      f"size {e['position_oz']:.2f} oz ({e['position_lots']:.2f} lot), "
+                      f"stop ${e['stop_price']:.2f}, gap ratio {e.get('gap_ratio_vs_entry','?')}x, bar {e['entry_time']}")
             elif e["type"] == "EXIT":
                 print(f"  -> EXIT ({e['reason']}, {e['result']}): {e['direction']} closed at "
                       f"${e['exit_price']:.2f}, net ${e['net_pnl_usd']:.2f}, balance now "
@@ -694,11 +887,25 @@ def run_once():
           f"Open positions: [{open_positions_summary2}] ({len(state['open_positions'])} open)")
 
     trade_log_df = read_trade_log()
-    html = build_html_report(state, events, trade_log_df)
+    # Pull the latest-available 1h bar's Close for mark-to-market in the HTML.
+    # This is the most recent price yfinance returned this cycle -- it may be the SAME
+    # bar as last cycle (if no new bar closed yet) but it is still "the latest price we
+    # have," which is what the user wants shown for open-position P&L.
+    latest_price = None
+    latest_bar_time = None
+    try:
+        if df is not None and len(df) > 0:
+            latest_price = float(df["Close"].iloc[-1])
+            latest_bar_time = str(df.index.max())
+    except Exception as e:
+        print(f"  (could not read latest price for report: {e})")
+    html = build_html_report(state, events, trade_log_df,
+                              last_price=latest_price, last_bar_time=latest_bar_time)
     os.makedirs(HTML_DIR, exist_ok=True)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"Report updated: {OUTPUT_HTML}")
+    print(f"Report updated: {OUTPUT_HTML}"
+          + (f" | latest ${latest_price:,.2f}" if latest_price is not None else ""))
 
 
 def _seconds_until_next_window_open():
